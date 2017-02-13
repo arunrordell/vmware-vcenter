@@ -15,6 +15,9 @@ Puppet::Type.newtype(:vc_vm) do
     newvalue(:absent) do
       provider.destroy
     end
+    newvalue(:modify_cd_rom) do
+      provider.modify_cd_rom
+    end
     defaultto(:present)
   end
 
@@ -59,6 +62,10 @@ Puppet::Type.newtype(:vc_vm) do
       Puppet.warn('target_datastore parameter deprecated')
       value
     end
+  end
+
+  newparam(:iso_file) do
+    desc 'iso file name to attach to cd_drive'
   end
 
   newparam(:datastore) do
@@ -109,6 +116,11 @@ Puppet::Type.newtype(:vc_vm) do
     desc 'Network Interfaces consist of a portgroup and nic_type'
     defaultto([])
   end
+
+  newparam(:nfs) do
+    desc 'nfs datastore hash to add nfs that contain iso file'
+    end
+
 
   newparam(:scsi_controller_type) do
     desc 'Virtual SCSI controller type for new Virtual Machine''s boot disk.'

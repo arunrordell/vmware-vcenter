@@ -8,7 +8,20 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
   @doc = 'Manages vCenter Virtual Machines.'
 
   def exists?
-    vm
+    if resource[:ensure] == :present
+      return vm && cdrom_iso && !resource[:iso_file].nil?
+    else
+      return vm
+    end
+
+  end
+
+   # checks if cd_rom has iso attached
+  def cdrom_iso
+    cdrom= vm.config.hardware.device.find { |hw| hw.class == RbVmomi::VIM::VirtualCdrom }
+    return cdrom.backing if cdrom.backing.class == RbVmomi::VIM::VirtualCdromIsoBackingInfo
+
+    nil
   end
 
   def srm
@@ -47,6 +60,63 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
          sleep 15
          vm.ResetVM_Task.wait_for_completion
       end
+    end
+  end
+
+  # Adds nfs_datastore on the host of the vm
+  # checks for existing nfs_datastores if exist
+  def add_nfs_ds
+    vm_host = find_vm_host
+    hds = vm_host.configManager.datastoreSystem
+    nfsdatastoreconfig = {:remoteHost => ASM::Util.get_preferred_ip(find_vm_host.name),
+                          :remotePath => resource[:nfs]["remote_path"],
+                          :localPath => "#{vm.name}_nfs",
+                          :accessMode => "readOnly"
+    }
+
+    nfsds = get_nfs_datastore(hds)
+    #checks if nfsdatastore already exists
+    if nfsds
+      Puppet.notice "nfs is already mounted as #{nfsds.info.name}"
+    else
+      nfsds = hds.CreateNasDatastore(:spec => VIM.HostNasVolumeSpec(nfsdatastoreconfig))
+      Puppet.notice "added nfs datastore #{nfsds.info.name} and mounted"
+    end
+
+    nfsds
+  end
+
+
+  # finds host to add nfs_datastore and returns the host object
+  def find_vm_host
+    hosts = datacenter.hostFolder.children.first.host
+    host = hosts.find { |host|
+      host.vm.select { |hvm|
+        hvm .eql?(vm)
+      }
+    }
+
+    host
+  end
+
+  # Selects nfs datastore on the host
+  def get_nfs_datastore(host_ds)
+    host_ds.datastore.find { |ds|
+      ds.info.respond_to?(:nas) and
+          ds.info.name == "#{vm.name}_nfs" and
+          ds.info.nas.remoteHost == ASM::Util.get_preferred_ip(find_vm_host.name)
+    }
+
+  end
+
+  # removes nfsdatastore from hots while vm_teardown
+  # make sure existing iso should be detached from cd?dvd before removing nfs_datastore
+  def remove_nfs_ds
+    vm_host = find_vm_host
+    nfsdatastore = get_nfs_datastore(vm_host)
+    if nfsdatastore
+      Puppet.notice "removing nfs datastore"
+      vm_host.configManager.datastoreSystem.RemoveDatastore(:datastore => nfsdatastore)
     end
   end
 
@@ -90,12 +160,52 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
   end
 
   def create
-    if resource[:template]
-      clone_vm
+    if vm
+      # mount or unmounts iso only if nfs is present
+      configure_iso if resource[:nfs]
     else
-      create_vm
+      if resource[:template]
+        clone_vm
+      else
+        create_vm
+      end
+      configure_iso
     end
+
     raise(Puppet::Error, "Unable to create VM: '#{resource[:name]}'") unless vm
+  end
+
+  # mount iso to cd drive or detach iso based on iso_file resource
+  # adds or removes nf data_store for mounting/unmounting  iso
+  def configure_iso
+    if power_state == 'poweredOn'
+      Puppet.notice "Powering off VM #{resource[:name]} prior to attach iso."
+      vm.PowerOffVM_Task.wait_for_completion
+    end
+    cdrom = vm.config.hardware.device.find { |hw| hw.class == RbVmomi::VIM::VirtualCdrom }
+
+    if resource[:iso_file]
+      nfs_ds = add_nfs_ds
+      # attach iso from cd/DVD drive
+      vm.ReconfigVM_Task(:spec => vm_reconfig_spec(nfs_ds, cdrom)).wait_for_completion
+    else
+      # removes only if iso is attached
+      if cdrom_iso
+        # detach iso from cd/DVD drive
+        vm.ReconfigVM_Task(:spec => vm_reconfig_spec(nil, cdrom)).wait_for_completion
+        Puppet.debug "detached Iso from cdrom"
+        remove_nfs_ds
+        Puppet.debug "removed Nfs datastore from #{vm.name}"
+      end
+    end
+
+    vm.PowerOnVM_Task.wait_for_completion if power_state == 'poweredOff'
+  end
+
+  def vm_reconfig_spec(datastore,  cd_obj = nil)
+    vm_devices = []
+    vm_devices.push(*cdrom_spec(datastore,cd_obj))
+    RbVmomi::VIM.VirtualMachineConfigSpec(:deviceChange => vm_devices)
   end
 
   def destroy
@@ -620,21 +730,45 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
     )
   end
 
-  # spec for creating virtualCdRom
-  # it creates empty CDROM each time creating new_vm
-  def cdrom_spec
+  # return iso_bakinginfo object only if iso_file name is present in resource.
+  def cd_drive_backing_info(datastore=nil)
+    if datastore && resource[:iso_file]
+      return RbVmomi::VIM.VirtualCdromIsoBackingInfo(:datastore => datastore, :fileName => "[#{datastore.info.name}]/#{resource[:iso_file]}")
+    else
+      return RbVmomi::VIM.VirtualCdromRemotePassthroughBackingInfo(:deviceName => "CDROM", :exclusive => false, :useAutoDetect => false)
+    end
+  end
+
+  # Spec for creating virtualCdRom and attach iso if required
+  # it creates CDROM with iso image on the nfs_datastore each time creating new_vm
+  #
+  # @note iso needs to be detached before removing nfs_datastore
+  # @param datastore [RbVmomi::VIM.Datastore]
+  # @param cdrom [RbVmomi::VIM.VirtualCdrom] object of the existing cd_drive for edit operation
+  #
+  # @return [RbVmomi::VIM.VirtualDeviceConfigSpec]
+  def cdrom_spec(datastore=nil, cdrom=nil)
     disk = RbVmomi::VIM.VirtualCdrom(
-        :backing => RbVmomi::VIM.VirtualCdromRemotePassthroughBackingInfo(:deviceName => "CDROM", :exclusive => false, :useAutoDetect => false),
+        :backing => cd_drive_backing_info(datastore),
         :connectable => virtualcd_connect_info,
-        :controllerKey => 201, #IDE Controllers start at 200
-        :key => 999,
-        :unitNumber => 0
+        :controllerKey => cdrom ? cdrom.controllerKey : 201, #IDE Controllers start at 200
+        :key => cdrom ? cdrom.key : 999,
+        :unitNumber => cdrom ? cdrom.unitNumber : 0
     )
 
-    config = {
-        :device => disk,
-        :operation => RbVmomi::VIM.VirtualDeviceConfigSpecOperation("add")
-    }
+     # edit cd_drive if vm is created and cd drive already exists else add cd_drive
+   if cdrom
+     config = {
+         :device => disk,
+         :operation => RbVmomi::VIM.VirtualDeviceConfigSpecOperation("edit")
+     }
+   else
+     config = {
+         :device => disk,
+         :operation => RbVmomi::VIM.VirtualDeviceConfigSpecOperation("add")
+     }
+   end
+
     RbVmomi::VIM.VirtualDeviceConfigSpec(config)
   end
 
