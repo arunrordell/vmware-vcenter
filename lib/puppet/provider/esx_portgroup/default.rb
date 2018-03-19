@@ -25,7 +25,7 @@ Puppet::Type.type(:esx_portgroup).provide(:esx_portgroup, :parent => Puppet::Pro
 
   def exists?
     Puppet.debug "Entered in exists method."
-    check_portgroup_existance == true
+   return check_portgroup_existance == true
   end
 
   # vlanid property getter method.
@@ -428,7 +428,7 @@ Puppet::Type.type(:esx_portgroup).provide(:esx_portgroup, :parent => Puppet::Pro
   # Private method to create the portgroup.
   def create_port_group
     Puppet.debug "Entering Create Port Group method."
-    @networksystem=host.configManager.networkSystem
+    @networksystem = host.configManager.networkSystem
     if (find_vswitch == false)
       raise Puppet::Error, "Unable to find the vSwitch " + resource[:vswitch]
     end
@@ -436,29 +436,32 @@ Puppet::Type.type(:esx_portgroup).provide(:esx_portgroup, :parent => Puppet::Pro
     hostportgroupspec = RbVmomi::VIM.HostPortGroupSpec(:name => resource[:portgrp], :policy => hostnetworkpolicy, :vlanId => resource[:vlanid], :vswitchName => resource[:vswitch])
     @networksystem.AddPortGroup(:portgrp => hostportgroupspec)
 
-    if (resource[:traffic_shaping_policy] !=nil )
+    if (resource[:traffic_shaping_policy] != nil)
       traffic_shaping
     end
-    if (resource[:failback] !=nil )
+    if (resource[:failback] != nil)
       set_failback
     end
-    if (resource[:overridefailoverorder] !=nil )
+    if (resource[:overridefailoverorder] != nil)
       setoverridepolicy
     end
-    if (resource[:checkbeacon]!= nil)
+    if (resource[:checkbeacon] != nil)
       set_checkbeacon
     end
     if (resource[:portgrouptype] == :VMkernel)
       Puppet.debug "Entering type VMkernel"
       add_virtual_nic
 
-      if (resource[:vmotion] !=nil )
+      if (resource[:vmotion] != nil)
         setupvmotion
       end
 
-      if (resource[:mtu] !=nil )
+      if (resource[:mtu] != nil)
         setupmtu
       end
+    end
+    if (resource[:uplinkteamingpolicy] != nil)
+
     end
     Puppet.notice "Successfully created a portgroup {" + resource[:portgrp] + "}"
   end
@@ -637,6 +640,10 @@ Puppet::Type.type(:esx_portgroup).provide(:esx_portgroup, :parent => Puppet::Pro
     mypg=find_portgroup
     actualspec = mypg.spec
 
+    Puppet.debug "debugging the port group network #{resource[:name]}"
+
+    Puppet.debug "debugging verridefailoverorder is #{resource[:uplinkteamingpolicy]}"
+
     if (resource[:overridefailoverorder] == :enabled)
       nicorderpolicy = resource[:nicorderpolicy ]
       if(nicorderpolicy != nil)
@@ -656,14 +663,47 @@ Puppet::Type.type(:esx_portgroup).provide(:esx_portgroup, :parent => Puppet::Pro
     hostnicteamingpolicy = RbVmomi::VIM.HostNicTeamingPolicy(:nicOrder => hostnicorderpolicy, :policy => resource[:uplinkteamingpolicy])
     hostnetworkpolicy = RbVmomi::VIM.HostNetworkPolicy(:nicTeaming=> hostnicteamingpolicy)
 
-    if (actualspec.policy != nil )
+    if (actualspec.policy != nil)
       if (actualspec.policy.nicTeaming != nil)
+        Puppet.debug "port_group policy nic teaming is already present for #{resource[:name]} "
         actualspec.policy.nicTeaming.nicOrder = hostnicorderpolicy
+        if (actualspec.policy.nicTeaming.policy != hostnicteamingpolicy.policy)
+          actualspec.policy.nicTeaming.policy = hostnicteamingpolicy.policy
+          Puppet.debug "changing  teaming  for #{resource[:name]} "
+        end
       else
+        Puppet.debug "port_group policy is nil so creating nicteaming for #{resource[:name]} "
         actualspec.policy.nicTeaming = hostnicteamingpolicy
       end
     else
+      Puppet.debug "port_group policy is nil so creating for #{resource[:name]}"
       actualspec.policy = hostnetworkpolicy
+    end
+
+    @networksystem.UpdatePortGroup(:pgName => resource[:portgrp], :portgrp => actualspec)
+  end
+
+  # uplinkteamingpolicy property setter method.
+  def uplinkteamingpolicy=(value)
+    Puppet.debug "Updating the uplink_teaming_policy"
+    begin
+      uplinkteamingpolicy
+      return true
+    rescue Exception => e
+      fail "Unable to configure the uplink teaming policy policy on a port group because the following exception occurred: -\n #{e.message}"
+    end
+  end
+
+  def uplinkteamingpolicy
+    Puppet.debug "Entering uplink_teamingpolicy"
+    @networksystem = host.configManager.networkSystem
+    mypg = find_portgroup
+    actualspec = mypg.spec
+
+    unless actualspec.policy
+      if (actualspec.policy.nicTeaming.policy != resource[:uplinkteamingpolicy])
+        actualspec.policy.nicTeaming.policy = hostnicteamingpolicy.policy
+      end
     end
 
     @networksystem.UpdatePortGroup(:pgName => resource[:portgrp], :portgrp => actualspec)
