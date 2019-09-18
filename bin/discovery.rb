@@ -168,6 +168,7 @@ def collect_host_attributes(host)
     attributes[:host_ip_addresses] = @host_config[host.name].network.vnic.map { |vnic| vnic.spec.ip.ipAddress }
   end
   attributes[:host_virtual_nics] = collect_host_vmk_ips(host)
+  attributes[:installed_software] = collect_host_vib_list(host) if host_connected?(host)
   attributes[:host_physical_nic] = collect_host_pnic_mac(host)
   attributes[:ntp_servers] = @host_config[host.name].dateTimeInfo.ntpConfig.server
 
